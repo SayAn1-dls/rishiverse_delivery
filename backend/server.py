@@ -611,6 +611,15 @@ async def shutdown_db_client():
     client.close()
 
 
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "rishiverse-backend"}
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
 app.include_router(api_router)
 
 app.add_middleware(
