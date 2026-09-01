@@ -10,7 +10,7 @@ A WhatsApp-enabled delivery management system for Gate No. 2, Rishihood Universi
 
 ## Stack
 - Frontend: React 19, Tailwind, shadcn/ui, recharts, qrcode.react, html5-qrcode
-- Backend: FastAPI, MongoDB (motor), JWT auth (bcrypt + PyJWT), Twilio SDK, Emergent Object Storage
+- Backend: FastAPI, MongoDB (motor), JWT auth (bcrypt + PyJWT), Twilio SDK, MongoDB-backed package photos
 - Monorepo: `/frontend` + `/backend`
 
 ## Run locally
@@ -28,7 +28,10 @@ yarn install
 yarn start
 ```
 
-## Demo accounts (seeded on startup)
+## Demo accounts
+
+Demo accounts are created only when `ENABLE_DEMO_SEED=true` is explicitly set before backend startup. Do not enable demo seeding in a real deployment unless you have changed the passwords first.
+
 | Role | Email | Password |
 |---|---|---|
 | Admin | admin@rishihood.edu.in | admin123 |

@@ -148,7 +148,7 @@ export default function Login() {
                 data-testid="login-password-input"
                 type="password"
                 required
-                minLength={6}
+                minLength={8}
                 placeholder="••••••••"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
