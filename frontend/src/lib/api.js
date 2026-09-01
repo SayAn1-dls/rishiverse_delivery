@@ -2,12 +2,7 @@ import axios from "axios";
 
 const api = axios.create({
   baseURL: `${process.env.REACT_APP_BACKEND_URL}/api`,
-});
-
-api.interceptors.request.use((config) => {
-  const token = localStorage.getItem("rishi_token");
-  if (token) config.headers.Authorization = `Bearer ${token}`;
-  return config;
+  withCredentials: true,
 });
 
 export function apiError(e) {
@@ -18,6 +13,6 @@ export function apiError(e) {
 }
 
 export const photoUrl = (deliveryId) =>
-  `${process.env.REACT_APP_BACKEND_URL}/api/deliveries/${deliveryId}/photo?auth=${localStorage.getItem("rishi_token")}`;
+  `${process.env.REACT_APP_BACKEND_URL}/api/deliveries/${deliveryId}/photo`;
 
 export default api;

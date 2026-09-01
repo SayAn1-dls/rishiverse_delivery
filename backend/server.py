@@ -6,9 +6,10 @@ load_dotenv(ROOT_DIR / '.env')
 
 import os
 import uuid
-import random
+import secrets
 import logging
 import asyncio
+import time
 import bcrypt
 import jwt
 from twilio.rest import Client as TwilioClient
@@ -20,20 +21,34 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 from typing import List, Optional
 
-mongo_url = os.environ.get('MONGO_URL', '')
+ENVIRONMENT = os.environ.get("ENVIRONMENT") or os.environ.get("APP_ENV") or os.environ.get("ENV") or "local"
+IS_LOCAL_ENV = ENVIRONMENT.lower() in {"local", "development", "dev", "test"}
+
+
+def require_env(name: str) -> str:
+    value = os.environ.get(name)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+mongo_url = require_env("MONGO_URL")
+db_name = require_env("DB_NAME")
 client = AsyncIOMotorClient(
     mongo_url,
     serverSelectionTimeoutMS=8000,
     connectTimeoutMS=8000,
     socketTimeoutMS=20000,
 )
-db = client[os.environ.get('DB_NAME', 'rishiverse_delivery')]
+db = client[db_name]
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
 JWT_ALGORITHM = "HS256"
-JWT_SECRET = os.environ["JWT_SECRET"]
+JWT_SECRET = require_env("JWT_SECRET")
+COOKIE_NAME = "access_token"
+COOKIE_MAX_AGE = 7 * 24 * 60 * 60
 
 TWILIO_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
@@ -44,6 +59,48 @@ twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID and TWILIO_
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+LOCAL_CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8001",
+    "http://127.0.0.1:8001",
+]
+
+
+def get_cors_origins() -> List[str]:
+    configured = os.environ.get("CORS_ORIGINS", "")
+    origins = [origin.strip() for origin in configured.split(",") if origin.strip()]
+    if "*" in origins:
+        raise RuntimeError("CORS_ORIGINS must not include '*' when credentialed cookies are enabled")
+    if origins:
+        return origins
+    if IS_LOCAL_ENV:
+        return LOCAL_CORS_ORIGINS
+    raise RuntimeError("Missing required environment variable: CORS_ORIGINS")
+
+
+RATE_LIMIT_WINDOW_SECONDS = 60
+RATE_LIMIT_MAX_ATTEMPTS = 5
+rate_limit_buckets = {}
+
+
+def client_ip(request: Request) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    if forwarded_for:
+        return forwarded_for.split(",", 1)[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def check_rate_limit(request: Request, scope: str):
+    key = (scope, client_ip(request))
+    now = time.monotonic()
+    attempts = [ts for ts in rate_limit_buckets.get(key, []) if now - ts < RATE_LIMIT_WINDOW_SECONDS]
+    if len(attempts) >= RATE_LIMIT_MAX_ATTEMPTS:
+        rate_limit_buckets[key] = attempts
+        raise HTTPException(status_code=429, detail="Too many attempts. Please try again in a minute.")
+    attempts.append(now)
+    rate_limit_buckets[key] = attempts
 
 
 def now_iso():
@@ -64,6 +121,21 @@ def create_access_token(user_id: str, email: str, role: str) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
+def set_auth_cookie(response: Response, token: str):
+    response.set_cookie(
+        key=COOKIE_NAME,
+        value=token,
+        max_age=COOKIE_MAX_AGE,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+    )
+
+
+def clear_auth_cookie(response: Response):
+    response.delete_cookie(key=COOKIE_NAME, httponly=True, secure=True, samesite="lax")
+
+
 async def resolve_user(token: str) -> dict:
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
@@ -80,7 +152,7 @@ async def resolve_user(token: str) -> dict:
 
 
 async def get_current_user(request: Request) -> dict:
-    token = request.cookies.get("access_token")
+    token = request.cookies.get(COOKIE_NAME)
     if not token:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
@@ -191,26 +263,37 @@ def next_free_slot(capacity, used_slots):
 
 # ---------- Auth ----------
 @api_router.post("/auth/register")
-async def register(body: RegisterRequest):
+async def register(body: RegisterRequest, response: Response):
     email = body.email.strip().lower()
+    if len(body.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters long")
     if await db.users.find_one({"email": email}):
         raise HTTPException(status_code=400, detail="Email already registered")
     user = {"id": str(uuid.uuid4()), "name": body.name.strip(), "email": email,
             "phone": body.phone, "role": "learner", "created_at": now_iso()}
     await db.users.insert_one({**user, "password_hash": hash_password(body.password)})
     token = create_access_token(user["id"], email, "learner")
+    set_auth_cookie(response, token)
     return {"user": user, "access_token": token}
 
 
 @api_router.post("/auth/login")
-async def login(body: LoginRequest):
+async def login(body: LoginRequest, response: Response, request: Request):
+    check_rate_limit(request, "auth_login")
     email = body.email.strip().lower()
     doc = await db.users.find_one({"email": email})
     if not doc or not verify_password(body.password, doc["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     user = {k: v for k, v in doc.items() if k not in ("_id", "password_hash")}
     token = create_access_token(user["id"], email, user["role"])
+    set_auth_cookie(response, token)
     return {"user": user, "access_token": token}
+
+
+@api_router.post("/auth/logout")
+async def logout(response: Response):
+    clear_auth_cookie(response)
+    return {"ok": True}
 
 
 @api_router.get("/auth/me")
@@ -272,7 +355,7 @@ async def mark_arrived(delivery_id: str, body: ArriveRequest,
         slot = next_free_slot(capacity, used)
         if slot is None:
             raise HTTPException(status_code=409, detail="Delivery room is full. Use collect-immediately instead.")
-    otp = f"{random.randint(0, 999999):06d}"
+    otp = f"{secrets.randbelow(1_000_000):06d}"
     update = {"status": "arrived", "storage": storage, "slot": slot,
               "otp": otp, "arrived_at": now_iso()}
     await db.deliveries.update_one({"id": delivery_id}, {"$set": update})
@@ -295,7 +378,7 @@ async def walk_in(body: WalkInRequest, user: dict = Depends(require_role("guard"
         slot = next_free_slot(capacity, used)
         if slot is None:
             raise HTTPException(status_code=409, detail="Delivery room is full. Use collect-immediately instead.")
-    otp = f"{random.randint(0, 999999):06d}"
+    otp = f"{secrets.randbelow(1_000_000):06d}"
     delivery = {
         "id": str(uuid.uuid4()), "learner_id": learner["id"], "learner_name": learner["name"],
         "courier": body.courier, "tracking_id": body.tracking_id or "",
@@ -331,7 +414,8 @@ async def complete_pickup(delivery_id: str, otp: str):
 
 
 @api_router.post("/deliveries/pickup/scan")
-async def scan_pickup(body: ScanRequest, user: dict = Depends(require_role("guard", "admin"))):
+async def scan_pickup(body: ScanRequest, request: Request, user: dict = Depends(require_role("guard", "admin"))):
+    check_rate_limit(request, "pickup_scan")
     parts = body.code.strip().split(":")
     if len(parts) != 3 or parts[0] != "GATEFLOW":
         raise HTTPException(status_code=400, detail="Not a valid GateFlow QR code")
@@ -340,7 +424,8 @@ async def scan_pickup(body: ScanRequest, user: dict = Depends(require_role("guar
 
 @api_router.post("/deliveries/{delivery_id}/pickup")
 async def verify_pickup(delivery_id: str, body: PickupRequest,
-                        user: dict = Depends(require_role("guard", "admin"))):
+                        request: Request, user: dict = Depends(require_role("guard", "admin"))):
+    check_rate_limit(request, "pickup_verify")
     return await complete_pickup(delivery_id, body.otp)
 
 
@@ -377,16 +462,7 @@ async def upload_photo(delivery_id: str, file: UploadFile = File(...),
 
 
 @api_router.get("/deliveries/{delivery_id}/photo")
-async def get_photo(delivery_id: str, request: Request, auth: Optional[str] = None):
-    token = auth
-    if not token:
-        token = request.cookies.get("access_token")
-        auth_header = request.headers.get("Authorization", "")
-        if not token and auth_header.startswith("Bearer "):
-            token = auth_header[7:]
-    if not token:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    user = await resolve_user(token)
+async def get_photo(delivery_id: str, user: dict = Depends(get_current_user)):
     delivery = await db.deliveries.find_one({"id": delivery_id}, {"_id": 0})
     if not delivery or not delivery.get("photo_path"):
         raise HTTPException(status_code=404, detail="Photo not found")
@@ -555,7 +631,7 @@ async def seed():
                 "courier": couriers[i % 6], "tracking_id": f"TRK{100200 + i * 37}",
                 "item_type": types[i % 6], "description": "", "status": "picked_up",
                 "storage": "room" if types[i % 6] != "food" else "counter",
-                "slot": None, "otp": f"{random.randint(0, 999999):06d}", "walk_in": i % 4 == 3,
+                "slot": None, "otp": f"{secrets.randbelow(1_000_000):06d}", "walk_in": i % 4 == 3,
                 "created_at": created.isoformat(), "arrived_at": arrived.isoformat(),
                 "picked_up_at": picked.isoformat()})
         await db.deliveries.insert_many(samples)
@@ -598,11 +674,15 @@ async def aging_monitor():
 
 @app.on_event("startup")
 async def on_startup():
-    try:
-        await seed()
-    except Exception as e:
-        import logging
-        logging.getLogger("rishiverse").error(f"Seed failed (DB may not be ready): {e}")
+    await db.users.create_index("email", unique=True)
+    if os.environ.get("ENABLE_DEMO_SEED", "").lower() == "true":
+        try:
+            await seed()
+        except Exception as e:
+            import logging
+            logging.getLogger("rishiverse").error(f"Seed failed (DB may not be ready): {e}")
+    elif not await db.settings.find_one({"key": "room"}):
+        await db.settings.insert_one({"key": "room", "capacity": 40, "aging_hours": 24})
     asyncio.create_task(aging_monitor())
 
 
@@ -625,7 +705,7 @@ app.include_router(api_router)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_origins=get_cors_origins(),
     allow_methods=["*"],
     allow_headers=["*"],
 )
