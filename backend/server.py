@@ -11,7 +11,6 @@ import logging
 import asyncio
 import bcrypt
 import jwt
-import requests
 from twilio.rest import Client as TwilioClient
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Depends, UploadFile, File
@@ -36,42 +35,7 @@ TWILIO_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 TWILIO_FROM = os.environ.get("TWILIO_WHATSAPP_FROM", "")
 twilio_client = TwilioClient(TWILIO_SID, TWILIO_TOKEN) if TWILIO_SID and TWILIO_TOKEN else None
 
-STORAGE_BASE = (os.environ.get("INTEGRATION_PROXY_URL") or "").strip() or "https://integrations.emergentagent.com"
-STORAGE_URL = STORAGE_BASE.rstrip("/") + "/objstore/api/v1/storage"
-EMERGENT_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
-storage_key = None
 
-
-def init_storage(force: bool = False):
-    global storage_key
-    if storage_key and not force:
-        return storage_key
-    resp = requests.post(f"{STORAGE_URL}/init", json={"emergent_key": EMERGENT_KEY}, timeout=30)
-    resp.raise_for_status()
-    storage_key = resp.json()["storage_key"]
-    return storage_key
-
-
-def put_object(path: str, data: bytes, content_type: str) -> dict:
-    key = init_storage()
-    resp = requests.put(f"{STORAGE_URL}/objects/{path}",
-                        headers={"X-Storage-Key": key, "Content-Type": content_type}, data=data, timeout=120)
-    if resp.status_code == 404:
-        key = init_storage(force=True)
-        resp = requests.put(f"{STORAGE_URL}/objects/{path}",
-                            headers={"X-Storage-Key": key, "Content-Type": content_type}, data=data, timeout=120)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def get_object(path: str):
-    key = init_storage()
-    resp = requests.get(f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key}, timeout=60)
-    if resp.status_code == 404:
-        key = init_storage(force=True)
-        resp = requests.get(f"{STORAGE_URL}/objects/{path}", headers={"X-Storage-Key": key}, timeout=60)
-    resp.raise_for_status()
-    return resp.content, resp.headers.get("Content-Type", "application/octet-stream")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -393,13 +357,18 @@ async def upload_photo(delivery_id: str, file: UploadFile = File(...),
     ext = (file.filename or "").rsplit(".", 1)[-1].lower()
     if ext not in ALLOWED_EXT:
         ext = "jpg"
+    import base64
     data = await file.read()
     if len(data) > 8 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="Photo too large (max 8MB)")
-    path = f"gateflow/packages/{delivery_id}/{uuid.uuid4()}.{ext}"
-    result = await asyncio.to_thread(put_object, path, data, file.content_type or "image/jpeg")
-    await db.deliveries.update_one({"id": delivery_id}, {"$set": {"photo_path": result["path"]}})
-    return {"photo_path": result["path"]}
+    photo_b64 = base64.b64encode(data).decode("utf-8")
+    content_type = file.content_type or "image/jpeg"
+    photo_path = f"deliveries/{delivery_id}/photo.{ext}"
+    await db.deliveries.update_one(
+        {"id": delivery_id},
+        {"$set": {"photo_data": photo_b64, "photo_content_type": content_type, "photo_path": photo_path}}
+    )
+    return {"photo_path": photo_path}
 
 
 @api_router.get("/deliveries/{delivery_id}/photo")
@@ -418,7 +387,12 @@ async def get_photo(delivery_id: str, request: Request, auth: Optional[str] = No
         raise HTTPException(status_code=404, detail="Photo not found")
     if user["role"] == "learner" and delivery["learner_id"] != user["id"]:
         raise HTTPException(status_code=403, detail="Insufficient permissions")
-    data, content_type = await asyncio.to_thread(get_object, delivery["photo_path"])
+    import base64
+    photo_b64 = delivery.get("photo_data")
+    if not photo_b64:
+        raise HTTPException(status_code=404, detail="Photo not found")
+    data = base64.b64decode(photo_b64)
+    content_type = delivery.get("photo_content_type", "image/jpeg")
     return Response(content=data, media_type=content_type)
 
 
@@ -620,11 +594,6 @@ async def aging_monitor():
 @app.on_event("startup")
 async def on_startup():
     await seed()
-    try:
-        await asyncio.to_thread(init_storage)
-        logger.info("Storage initialized")
-    except Exception as e:
-        logger.error(f"Storage init failed: {e}")
     asyncio.create_task(aging_monitor())
 
 
