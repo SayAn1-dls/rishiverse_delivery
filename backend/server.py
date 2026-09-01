@@ -20,14 +20,14 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 from typing import List, Optional
 
-mongo_url = os.environ['MONGO_URL']
+mongo_url = os.environ.get('MONGO_URL', '')
 client = AsyncIOMotorClient(
     mongo_url,
     serverSelectionTimeoutMS=8000,
     connectTimeoutMS=8000,
     socketTimeoutMS=20000,
 )
-db = client[os.environ['DB_NAME']]
+db = client[os.environ.get('DB_NAME', 'rishiverse_delivery')]
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
