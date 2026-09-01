@@ -21,7 +21,12 @@ from pydantic import BaseModel, Field
 from typing import List, Optional
 
 mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
+client = AsyncIOMotorClient(
+    mongo_url,
+    serverSelectionTimeoutMS=8000,
+    connectTimeoutMS=8000,
+    socketTimeoutMS=20000,
+)
 db = client[os.environ['DB_NAME']]
 
 app = FastAPI()
@@ -593,7 +598,11 @@ async def aging_monitor():
 
 @app.on_event("startup")
 async def on_startup():
-    await seed()
+    try:
+        await seed()
+    except Exception as e:
+        import logging
+        logging.getLogger("rishiverse").error(f"Seed failed (DB may not be ready): {e}")
     asyncio.create_task(aging_monitor())
 
 
